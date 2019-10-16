@@ -1,0 +1,16 @@
+[package]
+name = "convent"
+version = "0.1.0"
+authors = ["caelunshun <caelunshun@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+crossbeam-utils = "0.6.6"
+
+[dev-dependencies]
+criterion = "0.3.0"
+shrev = "1.1.1"
+
+[[bench]]
+name = "basic"
+harness = false
