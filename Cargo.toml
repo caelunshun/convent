@@ -10,6 +10,8 @@ crossbeam-utils = "0.6.6"
 [dev-dependencies]
 criterion = "0.3.0"
 shrev = "1.1.1"
+crossbeam = "0.7.2"
+rand = "0.7.2"
 
 [[bench]]
 name = "basic"
