@@ -81,6 +81,13 @@ struct Segment<T> {
     reads_remaining: AtomicUsize,
     slots: Vec<Slot<T>>,
     next: AtomicPtr<Segment<T>>,
+    /// The index of the next value to write into this segment.
+    /// If this value is found to equal `segment_size`, then a
+    /// writer should push the last value into this segment and then
+    /// allocate a new segment. If this value is found
+    /// to exceed `segment_size`, then a writer should wait for a new
+    /// segment to be allocated. (TODO: make this wait-free)
+    write_index: AtomicUsize,
 }
 
 impl<T> Drop for Segment<T> {
@@ -109,13 +116,6 @@ pub struct RawEventBuffer<T> {
     tail: AtomicPtr<Segment<T>>,
     num_readers: AtomicUsize,
     segment_size: usize,
-    /// The index of the next value to write into `head`.`
-    /// If this value is found to equal `segment_size`, then a
-    /// writer should push the last value into `head` and then
-    /// allocate a new segment. If this value is found
-    /// to exceed `segment_size`, then a writer should wait for a new
-    /// segment to be allocated. (TODO: make this wait-free)
-    write_index: AtomicUsize,
 }
 
 impl<T> RawEventBuffer<T> {
@@ -128,7 +128,6 @@ impl<T> RawEventBuffer<T> {
             tail: AtomicPtr::new(segment),
             num_readers: AtomicUsize::new(0),
             segment_size,
-            write_index: AtomicUsize::new(0),
         }
     }
 
@@ -148,14 +147,16 @@ impl<T> RawEventBuffer<T> {
         // value to the segment to allocate a new one. TODO: make this wait-free
         let backoff = Backoff::new();
         let (index, segment): (usize, *mut Segment<T>) = loop {
-            let index = self.write_index.fetch_add(1, Ordering::AcqRel);
+            let head = self.head.load(Ordering::Acquire);
+            // It is safe to read from `head`, since `head` never points to a full
+            // segment and a segment that is not full will not be dropped.
+            let index = unsafe { (*head).write_index.fetch_add(1, Ordering::AcqRel) };
 
             if index < self.segment_size - 1 {
                 // Success: a valid index into the segment has been acquired.
-                // We can now safely write to `self.head` until we increment its
-                // `length` field.
-                let segment = self.head.load(Ordering::Acquire);
-                break (index, segment);
+                // We can now safely write to `self.head` until we mark our slot
+                // as occupied.
+                break (index, head);
             } else if index == self.segment_size - 1 {
                 // We are writing the last element to the segment, so we need
                 // to allocate a new one and update `self.head` accordingly.
@@ -163,11 +164,11 @@ impl<T> RawEventBuffer<T> {
                     self.segment_size,
                     self.num_readers.load(Ordering::Acquire),
                 ));
+
                 let old = self.head.swap(new_segment, Ordering::AcqRel);
                 unsafe {
                     (&*old).next.store(new_segment, Ordering::Release);
                 }
-                self.write_index.store(0, Ordering::Release);
                 break (index, old);
             } else {
                 // Another thread is currently allocating a new segment. Wait for it to complete.
@@ -369,6 +370,7 @@ fn alloc_segment<T>(size: usize, num_readers: usize) -> Box<Segment<T>> {
         .take(size)
         .collect(),
         next: AtomicPtr::new(ptr::null_mut()),
+        write_index: AtomicUsize::new(0),
     })
 }
 
