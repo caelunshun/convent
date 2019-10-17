@@ -12,6 +12,7 @@ criterion = "0.3.0"
 shrev = "1.1.1"
 crossbeam = "0.7.2"
 rand = "0.7.2"
+static_assertions = "1.0.0"
 
 [[bench]]
 name = "basic"

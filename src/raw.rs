@@ -31,6 +31,15 @@ impl<T> Value<T> {
     }
 }
 
+impl<'a, T> IntoIterator for &'a Value<T> {
+    type Item = &'a T;
+    type IntoIter = ValueIter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 pub struct ValueIter<'a, T> {
     val: &'a Value<T>,
     index: usize,
@@ -182,10 +191,7 @@ impl<T> RawEventBuffer<T> {
     /// # Safety
     /// * `reader` must have been obtained through a previous call to `new_reader`
     /// _on this buffer_. If this is not the case, behavior is undefined.
-    pub unsafe fn read<'a>(
-        &'a self,
-        reader: &'a mut RawReader<T>,
-    ) -> impl Iterator<Item = &'a Value<T>> {
+    pub unsafe fn read<'a>(&'a self, reader: &'a mut RawReader<T>) -> RawIter<'a, T> {
         RawIter {
             buffer: self,
             reader,
@@ -344,6 +350,9 @@ pub struct RawReader<T> {
     index: usize,
 }
 
+unsafe impl<T: Send> Send for RawReader<T> {}
+unsafe impl<T: Sync> Sync for RawReader<T> {}
+
 fn alloc_segment<T>(size: usize, num_readers: usize) -> Box<Segment<T>> {
     Box::new(Segment {
         reads_remaining: AtomicUsize::new(size * num_readers),
@@ -434,7 +443,7 @@ mod tests {
         let buf = Arc::new(RawEventBuffer::with_segment_size(256));
 
         let t = 8;
-        let n = 1;
+        let n = 100_000;
 
         let received = Arc::new(Mutex::new(HashSet::new()));
         let sent = Arc::new(Mutex::new(HashSet::new()));
