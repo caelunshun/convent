@@ -5,7 +5,7 @@
 
 use crossbeam_utils::Backoff;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::{iter, ptr};
 
 /// As an optimization, we store values as either a single value
@@ -81,6 +81,8 @@ struct Segment<T> {
     reads_remaining: AtomicUsize,
     slots: Vec<Slot<T>>,
     next: AtomicPtr<Segment<T>>,
+    prev: AtomicPtr<Segment<T>>,
+    epoch: AtomicUsize,
 }
 
 impl<T> Drop for Segment<T> {
@@ -99,6 +101,9 @@ impl<T> Drop for Segment<T> {
 unsafe impl<T: Send> Send for Segment<T> {}
 unsafe impl<T: Sync> Sync for Segment<T> {}
 
+const MASK_WRITE_INDEX: u64 = 0xFF_FF_FF_FF;
+const MASK_EPOCH: u64 = 0xFF_FF_FF_FF_00_00_00_00;
+
 /// An event buffer.
 ///
 /// # Properties
@@ -109,26 +114,33 @@ pub struct RawEventBuffer<T> {
     tail: AtomicPtr<Segment<T>>,
     num_readers: AtomicUsize,
     segment_size: usize,
-    /// The index of the next value to write into `head`.`
+
+    /// This atomic contains two values: the 32 least significant
+    /// bits store the write index into the current segment, and
+    /// the most significant bits store an epoch counter representing
+    /// a unique ID of the current segment (this correlates to the
+    /// `epoch` field in `Segment`).
+    ///
+    /// The write index is the index of the next value to write into `head`.`
     /// If this value is found to equal `segment_size`, then a
     /// writer should push the last value into `head` and then
     /// allocate a new segment. If this value is found
     /// to exceed `segment_size`, then a writer should wait for a new
     /// segment to be allocated. (TODO: make this wait-free)
-    write_index: AtomicUsize,
+    write_index: AtomicU64,
 }
 
 impl<T> RawEventBuffer<T> {
     /// Creates a new `RawEventBuffer` with the given segment size.
     pub fn with_segment_size(segment_size: usize) -> Self {
         assert!(segment_size > 1);
-        let segment = Box::into_raw(alloc_segment(segment_size, 0));
+        let segment = Box::into_raw(alloc_segment(0, segment_size, 0));
         Self {
             head: AtomicPtr::new(segment),
             tail: AtomicPtr::new(segment),
             num_readers: AtomicUsize::new(0),
             segment_size,
-            write_index: AtomicUsize::new(0),
+            write_index: AtomicU64::new(0),
         }
     }
 
@@ -148,31 +160,48 @@ impl<T> RawEventBuffer<T> {
         // value to the segment to allocate a new one. TODO: make this wait-free
         let backoff = Backoff::new();
         let (index, segment): (usize, *mut Segment<T>) = loop {
-            let old_head = self.head.load(Ordering::Acquire);
-            let index = self.write_index.fetch_add(1, Ordering::AcqRel);
+            let value = self.write_index.fetch_add(1, Ordering::AcqRel);
+            let mut segment = self.head.load(Ordering::Acquire);
+            let index = (value & MASK_WRITE_INDEX) as usize;
+            let epoch = ((value & MASK_EPOCH) >> 32) as usize;
 
             if index < self.segment_size - 1 {
                 // Success: a valid index into the segment has been acquired.
-                // We can now safely write to `self.head` until we increment its
-                // `length` field, as long as it has not changed since we read `self.write_index`.
-                let new_head = self.head.load(Ordering::Acquire);
-                if new_head == old_head {
-                    break (index, new_head);
-                } else {
-                    backoff.spin();
+                // We can now safely write to the segment with the corresponding
+                // epoch until we mark our slot as occupied.
+
+                // Find the segment with the same epoch as the write index we read.
+
+                // Loop through the list from the tail
+                // until we find the correct segment.
+                unsafe {
+                    debug_assert!(!segment.is_null());
+                    while (*segment).epoch.load(Ordering::Relaxed) != epoch {
+                        debug_assert!(!segment.is_null());
+                        segment = (*segment).prev.load(Ordering::Acquire);
+                    }
                 }
+
+                break (index, segment);
             } else if index == self.segment_size - 1 {
                 // We are writing the last element to the segment, so we need
                 // to allocate a new one and update `self.head` accordingly.
                 let new_segment = Box::into_raw(alloc_segment(
+                    epoch + 1,
                     self.segment_size,
                     self.num_readers.load(Ordering::Acquire),
                 ));
-                let old = self.head.swap(new_segment, Ordering::AcqRel);
+
+                let old = self.head.load(Ordering::Acquire);
+                unsafe {
+                    (*new_segment).prev.store(old, Ordering::Release);
+                }
+                self.head.store(new_segment, Ordering::Release);
                 unsafe {
                     (&*old).next.store(new_segment, Ordering::Release);
                 }
-                self.write_index.store(0, Ordering::Release);
+                self.write_index
+                    .store(((epoch + 1) as u64) << 32, Ordering::Release);
                 break (index, old);
             } else {
                 // Another thread is currently allocating a new segment. Wait for it to complete.
@@ -364,7 +393,7 @@ pub struct RawReader<T> {
 unsafe impl<T: Send> Send for RawReader<T> {}
 unsafe impl<T: Sync> Sync for RawReader<T> {}
 
-fn alloc_segment<T>(size: usize, num_readers: usize) -> Box<Segment<T>> {
+fn alloc_segment<T>(epoch: usize, size: usize, num_readers: usize) -> Box<Segment<T>> {
     Box::new(Segment {
         reads_remaining: AtomicUsize::new(size * num_readers),
         slots: iter::repeat_with(|| Slot {
@@ -373,7 +402,9 @@ fn alloc_segment<T>(size: usize, num_readers: usize) -> Box<Segment<T>> {
         })
         .take(size)
         .collect(),
+        epoch: AtomicUsize::new(epoch),
         next: AtomicPtr::new(ptr::null_mut()),
+        prev: AtomicPtr::new(ptr::null_mut()),
     })
 }
 
