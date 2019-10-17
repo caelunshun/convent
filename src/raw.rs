@@ -148,14 +148,19 @@ impl<T> RawEventBuffer<T> {
         // value to the segment to allocate a new one. TODO: make this wait-free
         let backoff = Backoff::new();
         let (index, segment): (usize, *mut Segment<T>) = loop {
+            let old_head = self.head.load(Ordering::Acquire);
             let index = self.write_index.fetch_add(1, Ordering::AcqRel);
 
             if index < self.segment_size - 1 {
                 // Success: a valid index into the segment has been acquired.
                 // We can now safely write to `self.head` until we increment its
-                // `length` field.
-                let segment = self.head.load(Ordering::Acquire);
-                break (index, segment);
+                // `length` field, as long as it has not changed since we read `self.write_index`.
+                let new_head = self.head.load(Ordering::Acquire);
+                if new_head == old_head {
+                    break (index, new_head);
+                } else {
+                    backoff.spin();
+                }
             } else if index == self.segment_size - 1 {
                 // We are writing the last element to the segment, so we need
                 // to allocate a new one and update `self.head` accordingly.

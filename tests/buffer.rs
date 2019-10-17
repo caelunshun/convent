@@ -66,8 +66,6 @@ fn mpmc() {
                 for i in 0..COUNT {
                     buf.single_write(i);
                 }
-
-                dbg!();
             });
 
             let mut reader = readers[thread].take().unwrap();
