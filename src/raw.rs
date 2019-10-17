@@ -308,12 +308,18 @@ impl<'a, T> Iterator for RawIter<'a, T> {
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.reader.segment.is_null() {
-            return None;
+            // Attempt to load new segment from `tail`
+            let tail = self.buffer.tail.load(Ordering::Acquire);
+            if tail.is_null() {
+                return None;
+            } else {
+                self.reader.segment = tail;
+            }
         }
 
         let slot = unsafe { &(*self.reader.segment).slots[self.reader.index] };
 
-        if !slot.occupied.load(Ordering::Relaxed) {
+        if !slot.occupied.load(Ordering::Acquire) {
             // Slot not occupied: we have reached the end.
             return None;
         }
